@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Voice Agent</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e8e8ea; --muted:#8a8f98; --accent:#5b9dff; --user:#1d2633; --bot:#1a2b22; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.hint { color:var(--muted); margin:0 0 16px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px; font-size:15px; cursor:pointer; }
+  button.stop { background:#d9534f; }
+  #status { margin-left:12px; color:var(--muted); }
+  #metrics { font:12px ui-monospace, monospace; color:var(--muted); margin:12px 0; min-height:18px; white-space:pre-wrap; }
+  #log { display:flex; flex-direction:column; gap:8px; }
+  .msg { padding:8px 12px; border-radius:10px; max-width:85%; }
+  .user { background:var(--user); align-self:flex-end; }
+  .bot { background:var(--bot); align-self:flex-start; }
+  .sys { color:var(--muted); font-size:12px; align-self:center; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Local Voice Agent</h1>
+  <p class="hint">Use headphones. Interrupt the agent any time by speaking.</p>
+  <button id="btn">Start talking</button><span id="status">idle</span>
+  <div id="metrics"></div>
+  <div id="log"></div>
+</main>
+<script>
+const CAPTURE_WORKLET = `
+class Capture extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = new Int16Array(512); this.n = 0; }
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
+      this.buf[this.n++] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      if (this.n === 512) { this.port.postMessage(this.buf.buffer, [this.buf.buffer]); this.buf = new Int16Array(512); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);`;
+
+const PLAYBACK_WORKLET = `
+class Playback extends AudioWorkletProcessor {
+  constructor() {
+    super(); this.queue = []; this.cur = null; this.pos = 0;
+    this.port.onmessage = (e) => {
+      if (e.data === 'flush') { this.queue = []; this.cur = null; this.pos = 0; }
+      else this.queue.push(e.data);
+    };
+  }
+  process(_inputs, outputs) {
+    const out = outputs[0][0];
+    for (let i = 0; i < out.length; i++) {
+      if (!this.cur || this.pos >= this.cur.length) { this.cur = this.queue.shift() || null; this.pos = 0; }
+      out[i] = this.cur ? this.cur[this.pos++] : 0;
+    }
+    return true;
+  }
+}
+registerProcessor('playback', Playback);`;
+
+const $ = (id) => document.getElementById(id);
+let ws, micCtx, playCtx, stream, playNode;
+
+function addMsg(cls, text) {
+  const last = $('log').lastElementChild;
+  if (cls === 'bot' && last && last.classList.contains('bot') && !last.dataset.closed) { last.textContent += ' ' + text; }
+  else { const d = document.createElement('div'); d.className = 'msg ' + cls; d.textContent = text; $('log').appendChild(d); }
+  window.scrollTo(0, document.body.scrollHeight);
+}
+function closeBot() { const l = $('log').lastElementChild; if (l && l.classList.contains('bot')) l.dataset.closed = '1'; }
+
+async function workletFromString(ctx, src) {
+  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+}
+
+async function start() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  playCtx = new AudioContext({ sampleRate: 24000 });
+  await workletFromString(playCtx, PLAYBACK_WORKLET);
+  playNode = new AudioWorkletNode(playCtx, 'playback');
+  playNode.connect(playCtx.destination);
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  micCtx = new AudioContext({ sampleRate: 16000 });   // browser resamples the mic to 16 kHz
+  await workletFromString(micCtx, CAPTURE_WORKLET);
+  const capture = new AudioWorkletNode(micCtx, 'capture');
+  capture.port.onmessage = (e) => { if (ws.readyState === 1) ws.send(e.data); };
+  micCtx.createMediaStreamSource(stream).connect(capture);
+
+  ws.onmessage = (e) => {
+    if (typeof e.data !== 'string') {
+      const i16 = new Int16Array(e.data);
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+      playNode.port.postMessage(f32, [f32.buffer]);
+      $('status').textContent = 'speaking';
+      return;
+    }
+    const ev = JSON.parse(e.data);
+    if (ev.type === 'interrupt') { playNode.port.postMessage('flush'); closeBot(); addMsg('sys', '— interrupted —'); }
+    else if (ev.type === 'user_speaking') { playNode.port.postMessage('flush'); $('status').textContent = 'listening'; }
+    else if (ev.type === 'user_text') { closeBot(); addMsg('user', ev.text); $('status').textContent = 'thinking'; }
+    else if (ev.type === 'assistant_text') addMsg('bot', ev.text);
+    else if (ev.type === 'metrics') {
+      const { type, ...m } = ev;
+      $('metrics').textContent = Object.entries(m).map(([k, v]) => `${k}=${v}`).join('  ');
+    }
+  };
+  ws.onclose = () => stop();
+  $('btn').textContent = 'Stop'; $('btn').classList.add('stop'); $('status').textContent = 'listening';
+}
+
+function stop() {
+  if (ws && ws.readyState <= 1) ws.close();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  if (micCtx) micCtx.close(); if (playCtx) playCtx.close();
+  ws = micCtx = playCtx = stream = null;
+  $('btn').textContent = 'Start talking'; $('btn').classList.remove('stop'); $('status').textContent = 'idle';
+}
+
+$('btn').onclick = () => (ws ? stop() : start().catch((err) => { addMsg('sys', 'Error: ' + err.message); stop(); }));
+</script>
+</body>
+</html>
